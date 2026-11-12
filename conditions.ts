@@ -1,6 +1,7 @@
 import * as fs from "node:fs/promises"
 import * as net from "node:net"
 import * as path from "node:path"
+import { createFileWatch, type FileWatch } from "./watch.ts"
 
 export type WaitConditionType =
   | "file_exists"
@@ -35,6 +36,8 @@ export interface WaitOptions {
   signal?: AbortSignal
   assertExternal?: (fullPath: string) => Promise<void>
   progress?: (event: { status: string }) => Promise<void> | void
+  /** Test seam for the native watch fast path; defaults to a real watcher. */
+  watch?: (fullPath: string) => Promise<FileWatch | null>
 }
 
 export interface WaitResult {
@@ -65,6 +68,8 @@ type EvalState = {
   matcher?: (text: string) => { matched: boolean; index: number }
   /** Next byte offset for mustBeNew file_contains reads. */
   cursor?: number
+  /** More unread new content remains after the last chunked read. */
+  pending?: boolean
   /** Parsed dot/bracket path for http_json, created once per wait. */
   jsonParts?: string[]
 }
@@ -83,6 +88,8 @@ const REGEX_OVERLAP_BYTES = 4 * 1024
 /** After this long, back off polling up to MAX_BACKOFF_MS. */
 const BACKOFF_AFTER_MS = 30_000
 const MAX_BACKOFF_MS = 5_000
+/** Reconciliation cadence while a native watcher is active. */
+const WATCH_RECONCILE_MS = 2_000
 
 const clamp = (value: number, min: number, max: number): number =>
   Math.max(min, Math.min(max, Math.trunc(value)))
@@ -384,6 +391,45 @@ async function assertPath(state: EvalState, options: WaitOptions, fullPath: stri
   state.asserted.add(fullPath)
 }
 
+function fileConditionPath(condition: WaitCondition): string | undefined {
+  switch (condition.type) {
+    case "file_exists":
+    case "file_absent":
+    case "file_changed":
+    case "file_contains":
+      return condition.path
+    default:
+      return undefined
+  }
+}
+
+/**
+ * Do not let a reconciliation poll overshoot a `stableForMs` deadline. Without
+ * this, a watcher could report no new events and the wait would discover
+ * stability up to one reconciliation interval late.
+ */
+function stableWaitMs(condition: WaitCondition, state: EvalState, base: number): number {
+  if (
+    (condition.type === "file_exists" || condition.type === "file_changed") &&
+    condition.stableForMs
+  ) {
+    if (state.stable) {
+      const remaining = condition.stableForMs - (Date.now() - state.stable.since)
+      return Math.max(1, Math.min(base, remaining))
+    }
+  }
+  return base
+}
+
+/**
+ * `file_contains` with `mustBeNew` processes at most NEW_BYTES per check. If
+ * more new content is waiting, re-check immediately instead of making the
+ * reconciliation timer split a large append into 2-second slices.
+ */
+function pendingFileContent(condition: WaitCondition, state: EvalState): boolean {
+  return condition.type === "file_contains" && condition.mustBeNew && state.pending === true
+}
+
 async function statMaybe(fullPath: string) {
   try {
     return await fs.stat(fullPath)
@@ -611,6 +657,7 @@ async function evaluate(
       const stat = await statMaybe(fullPath)
       if (!stat) {
         state.initialSize ??= 0
+        state.pending = false
         return { matched: false, observed: { path: fullPath, exists: false } }
       }
 
@@ -635,6 +682,12 @@ async function evaluate(
             ? REGEX_OVERLAP_BYTES
             : Math.max(0, condition.pattern.length - 1)
           state.cursor = Math.max(start, start + read.bytesRead - overlap)
+          // Only ask for an immediate re-check when the chunk was capped and
+          // unread bytes remain. The cursor intentionally backs up by an
+          // overlap, so `cursor < size` alone would spin at EOF.
+          state.pending = start + read.bytesRead < stat.size
+        } else {
+          state.pending = false
         }
         return {
           matched: false,
@@ -647,6 +700,7 @@ async function evaluate(
           },
         }
       }
+      state.pending = false
       return {
         matched: true,
         observed: {
@@ -800,82 +854,137 @@ export async function runWait(condition: WaitCondition, options: WaitOptions): P
   let lastProgress = 0
   let delay = intervalMs
 
-  while (true) {
-    if (options.signal?.aborted) {
-      return {
-        matched: false,
-        timedOut: false,
-        aborted: true,
-        condition: describeCondition(condition),
-        elapsedMs: Date.now() - started,
-        attempts,
-        observed: summarizeObserved(last.observed),
-        ...(last.excerpt ? { excerpt: last.excerpt } : {}),
-        ...(last.error ? { lastError: last.error } : {}),
+  // Create the watcher only after the first condition check fails. An
+  // already-satisfied wait should not pay for statfs + fs.watch setup.
+  let watch: FileWatch | null | undefined
+  let watchPath: string | undefined
+  const filePath = fileConditionPath(condition)
+  if (filePath) {
+    watchPath = resolvePath(options.root, filePath)
+    await assertPath(state, options, watchPath)
+  }
+
+  try {
+    while (true) {
+      if (options.signal?.aborted) {
+        return {
+          matched: false,
+          timedOut: false,
+          aborted: true,
+          condition: describeCondition(condition),
+          elapsedMs: Date.now() - started,
+          attempts,
+          observed: summarizeObserved(last.observed),
+          ...(last.excerpt ? { excerpt: last.excerpt } : {}),
+          ...(last.error ? { lastError: last.error } : {}),
+        }
+      }
+
+      attempts += 1
+      last = await evaluate(condition, state, options, intervalMs)
+
+      if (last.matched) {
+        return {
+          matched: true,
+          timedOut: false,
+          aborted: false,
+          condition: describeCondition(condition),
+          elapsedMs: Date.now() - started,
+          attempts,
+          observed: summarizeObserved(last.observed),
+          ...(last.excerpt ? { excerpt: last.excerpt } : {}),
+        }
+      }
+
+      const elapsed = Date.now() - started
+      if (elapsed >= timeoutMs) {
+        return {
+          matched: false,
+          timedOut: true,
+          aborted: false,
+          condition: describeCondition(condition),
+          elapsedMs: elapsed,
+          attempts,
+          observed: summarizeObserved(last.observed),
+          ...(last.excerpt ? { excerpt: last.excerpt } : {}),
+          ...(last.error ? { lastError: last.error } : {}),
+        }
+      }
+
+      if (options.progress && Date.now() - lastProgress >= 1_000) {
+        lastProgress = Date.now()
+        try {
+          // Do not let a slow UI progress update delay the next condition check.
+          void Promise.resolve(
+            options.progress({
+              status: `waiting for ${describeCondition(condition)} (${Math.round(elapsed / 1000)}s)`,
+            }),
+          ).catch(() => {})
+        } catch {}
+      }
+
+      if (watch === undefined && watchPath) {
+        try {
+          watch = await (options.watch ?? createFileWatch)(watchPath)
+        } catch {
+          watch = null
+        }
+      }
+
+      if (watch) {
+        const base = Math.max(1_000, Math.min(WATCH_RECONCILE_MS, intervalMs * 2))
+        const waitMs = pendingFileContent(condition, state)
+          ? 1
+          : Math.max(1, Math.min(timeoutMs - elapsed, stableWaitMs(condition, state, base)))
+        let outcome: Awaited<ReturnType<FileWatch["next"]>>
+        try {
+          outcome = await watch.next(waitMs, options.signal)
+        } catch {
+          watch.close()
+          watch = null
+          delay = intervalMs
+          continue
+        }
+        if (outcome === "event") {
+          delay = intervalMs
+          continue
+        }
+        if (outcome === "closed") {
+          watch.close()
+          watch = null
+          delay = intervalMs
+          continue
+        }
+        if (outcome === "aborted") {
+          if (options.signal?.aborted) continue
+          watch.close()
+          watch = null
+          delay = intervalMs
+          continue
+        }
+      } else {
+        if (elapsed > BACKOFF_AFTER_MS) {
+          delay = Math.min(MAX_BACKOFF_MS, Math.max(intervalMs, delay * 2))
+        }
+
+        try {
+          await sleep(Math.min(delay, timeoutMs - elapsed), options.signal)
+        } catch {
+          return {
+            matched: false,
+            timedOut: false,
+            aborted: true,
+            condition: describeCondition(condition),
+            elapsedMs: Date.now() - started,
+            attempts,
+            observed: summarizeObserved(last.observed),
+            ...(last.excerpt ? { excerpt: last.excerpt } : {}),
+            ...(last.error ? { lastError: last.error } : {}),
+          }
+        }
       }
     }
-
-    attempts += 1
-    last = await evaluate(condition, state, options, intervalMs)
-
-    if (last.matched) {
-      return {
-        matched: true,
-        timedOut: false,
-        aborted: false,
-        condition: describeCondition(condition),
-        elapsedMs: Date.now() - started,
-        attempts,
-        observed: summarizeObserved(last.observed),
-        ...(last.excerpt ? { excerpt: last.excerpt } : {}),
-      }
-    }
-
-    const elapsed = Date.now() - started
-    if (elapsed >= timeoutMs) {
-      return {
-        matched: false,
-        timedOut: true,
-        aborted: false,
-        condition: describeCondition(condition),
-        elapsedMs: elapsed,
-        attempts,
-        observed: summarizeObserved(last.observed),
-        ...(last.excerpt ? { excerpt: last.excerpt } : {}),
-        ...(last.error ? { lastError: last.error } : {}),
-      }
-    }
-
-    if (options.progress && Date.now() - lastProgress >= 1_000) {
-      lastProgress = Date.now()
-      try {
-        // Do not let a slow UI progress update delay the next condition check.
-        void Promise.resolve(
-          options.progress({
-            status: `waiting for ${describeCondition(condition)} (${Math.round(elapsed / 1000)}s)`,
-          }),
-        ).catch(() => {})
-      } catch {}
-    }
-
-    if (elapsed > BACKOFF_AFTER_MS) {
-      delay = Math.min(MAX_BACKOFF_MS, Math.max(intervalMs, delay * 2))
-    }
-
-    try {
-      await sleep(Math.min(delay, timeoutMs - elapsed), options.signal)
-    } catch {
-      return {
-        matched: false,
-        timedOut: false,
-        aborted: true,
-        condition: describeCondition(condition),
-        elapsedMs: Date.now() - started,
-        attempts,
-        observed: summarizeObserved(last.observed),
-        ...(last.excerpt ? { excerpt: last.excerpt } : {}),
-        ...(last.error ? { lastError: last.error } : {}),
-      }
-    }
+  } finally {
+    watch?.close()
   }
 }

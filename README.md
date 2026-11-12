@@ -108,7 +108,7 @@ wait_for({ path: "/tmp/app.log", pattern: "ERROR", must_be_new: true })
 | `pattern` | string | — | 正则，需配合 `path`。只匹配文件尾部 64KB |
 | `pid` | number | — | 等待该进程退出。可与 `path` 组合 |
 | `timeout_ms` | number | `240000` | 上限 `600000` |
-| `poll_ms` | number | `500` | 最小 `100`，一般不用改 |
+| `poll_ms` | number | `500` | 最小 `100`。有原生 watcher 时仍作为低频兜底轮询；远程文件系统用完整间隔轮询 |
 | `tail_lines` | number | `60` | 返回日志的行数 |
 | `must_be_new` | boolean | `false` | 只认调用后的新增内容 |
 
@@ -133,7 +133,16 @@ pid 12345 仍在运行 —— 任务可能只是慢，不是卡死
 
 ## 设计取舍
 
-**为什么是轮询而不是 inotify/fs.watch？** 日志文件通常由 shell 重定向写入，`fs.watch` 在跨平台、NFS、容器挂载卷上行为不一致（丢事件、重复事件、`rename` 失效）。构建日志的量级下，`stat` 的代价可以忽略——实测 11MB 文件轮询 3 秒的开销测不出来。稳定性优先。
+**为什么现在用「原生通知 + 轮询兜底」，而不是纯轮询？** 本地文件系统上，`fs.watch` 能把默认 1 秒的发现延迟降到几十毫秒；但 `fs.watch` 在 NFS、SMB、sshfs/FUSE、9p 和部分容器挂载上会丢事件或直接不支持。因此通知只作为**唤醒提示**，不承担正确性：
+
+- 文件和它的父目录变化都会触发一次真实条件检查，通知本身不作为结果。
+- 每个 wait 始终保留低频 reconciliation 轮询（约 2 秒）；`poll_ms` 仍是纯轮询时的间隔。
+- 通过 `statfs` 识别网络/FUSE 文件系统，直接跳过 watcher，只用轮询。
+- watcher 报错、关闭、达到 inotify 上限、原子 `rename` 替换文件时，自动退回轮询或重新建立监视。
+- `stableForMs` 会计算剩余稳定时间，不会因为 reconciliation 间隔而晚到。
+- `mustBeNew` / `must_be_new` 的大块新内容会立即继续读取，不会把 256KB 之后的内容拖到下一次轮询。
+
+实测在默认 1 秒轮询下，本地文件出现到返回：纯轮询 **1003ms**，watch 唤醒 **50ms**。远程文件仍然是纯轮询，但正确性不依赖任何通知。
 
 **为什么只读尾部 64KB？** Maven/Gradle 日志动辄几十 MB。用 `open` + 定位偏移读，而不是 `readFile`，避免把整个文件拉进内存。同一个 `must_be_new` 检查也只读新增区段。
 
