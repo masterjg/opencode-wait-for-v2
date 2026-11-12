@@ -108,7 +108,7 @@ wait_for({ path: "/tmp/app.log", pattern: "ERROR", must_be_new: true })
 | `pattern` | string | — | Regular expression; requires `path`. Matches only the last 64 KB. |
 | `pid` | number | — | Wait for this process to exit. Can be combined with `path`. |
 | `timeout_ms` | number | `240000` | Maximum wait; capped at `600000`. |
-| `poll_ms` | number | `500` | Poll interval; minimum `100`. Usually not needed. |
+| `poll_ms` | number | `500` | Poll interval; minimum `100`. With a native watcher this remains the low-frequency fallback cadence; remote filesystems poll at the full interval. |
 | `tail_lines` | number | `60` | Number of log lines returned. |
 | `must_be_new` | boolean | `false` | Only consider content written after the call starts. |
 
@@ -133,7 +133,16 @@ The result deliberately separates two signals:
 
 ## Design trade-offs
 
-**Why polling instead of inotify/fs.watch?** Log files are usually written through shell redirection, and `fs.watch` behaves inconsistently across platforms, NFS, and container mounts (missed events, duplicate events, broken `rename` handling). At build-log scale the cost of `stat` is negligible - polling an 11 MB file for three seconds was not measurable. Stability wins.
+**Why native notifications with a polling fallback instead of polling only?** On local filesystems, `fs.watch` cuts the default 1-second discovery delay to tens of milliseconds. But `fs.watch` misses events or is unsupported on NFS, SMB, sshfs/FUSE, 9p, and some container mounts. Notifications are therefore only **wake-up hints** and never carry correctness:
+
+- A file or parent-directory change triggers a real condition check; the event itself is not a result.
+- Every wait keeps a low-frequency reconciliation poll (~2s); `poll_ms` is still the interval for polling-only mode.
+- `statfs` identifies network/FUSE filesystems and skips the watcher entirely.
+- Watcher errors, closes, inotify limits, and atomic `rename` replacement fall back to polling or re-arm the monitor.
+- `stableForMs` computes the remaining stability time, so reconciliation cannot delay a stable result.
+- `mustBeNew` / `must_be_new` chunked reads continue immediately when unread new content remains, instead of waiting for the next poll.
+
+Measured with the default 1-second poll, a local file appearing after 50 ms: polling only **1003 ms**, watch wake-up **50 ms**. Remote files still use polling only, and correctness never depends on notifications.
 
 **Why read only the last 64 KB?** Maven/Gradle logs are often tens of megabytes. The plugin uses `open` plus an offset read instead of `readFile`, so it never pulls the whole file into memory. The same `must_be_new` check reads only the new range.
 

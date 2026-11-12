@@ -1,5 +1,6 @@
 import { open, stat } from "node:fs/promises"
 import { normalizeCondition, runWait, type WaitResult } from "./conditions.ts"
+import { createFileWatch, type FileWatch } from "./watch.ts"
 
 /**
  * opencode-wait-for-v2 - a "wait for new output" primitive for OpenCode V2.
@@ -21,7 +22,7 @@ import { normalizeCondition, runWait, type WaitResult } from "./conditions.ts"
  * Approach
  * --------
  * Put the wait into one tool call:
- *   - the command polls internally; the conversation uses one call
+ *   - the condition waits internally (local watch fast path, polling fallback)
  *   - return as soon as the condition holds, not at the timeout
  *   - timeouts do not throw; return process state and the log tail so the
  *     model can tell "slow" from "stuck"
@@ -117,6 +118,8 @@ const DESCRIPTION = [
   "  1. Wait for a file to appear: pass only path",
   "  2. Wait for a log line: path + pattern (regular expression)",
   "  3. Wait for a process to exit: pid",
+  "",
+  "Local file conditions prefer native file notifications with a low-frequency polling fallback; remote filesystems automatically use polling only.",
   "",
   "Returns as soon as the condition holds; does not wait for the timeout. A timeout also returns normally (output starts with `[wait_for] timed out`,",
   "with process state and the log tail attached). When that happens, check whether the process is still alive instead of calling wait_for again immediately.",
@@ -317,6 +320,10 @@ export default {
           let snapshotKey = ""
           let snapshotRaw = ""
 
+          // Create the watcher only after the first condition check fails. An
+          // already-satisfied wait should not pay for statfs + fs.watch setup.
+          let watch: FileWatch | null | undefined
+
           /** Report progress so the UI does not appear frozen during the wait - the worst part of sleep polling. */
           const reportProgress = async (note: string) => {
             const now = Date.now()
@@ -347,91 +354,134 @@ export default {
             },
           })
 
-          while (true) {
-            if (context?.signal?.aborted) {
-              throw new Error("wait_for aborted")
-            }
-
-            const problems: string[] = []
-            let matched = true
-            let snapshot = ""
-            let pidAlive = false
-
-            // Evaluate each condition independently and record its own reason so one failure does not hide the others.
-            if (pid !== undefined) {
-              pidAlive = processAlive(pid)
-              if (pidAlive) {
-                matched = false
-                problems.push(`pid ${pid} is still running`)
+          try {
+            while (true) {
+              if (context?.signal?.aborted) {
+                throw new Error("wait_for aborted")
               }
-            }
 
-            // Read the log even when the pid is still alive; otherwise a timeout cannot include the log tail.
-            if (path) {
-              try {
-                const info = await stat(path)
-                if (info.size !== lastSize) {
-                  lastSize = info.size
-                  lastChangeAt = Date.now()
-                }
+              const problems: string[] = []
+              let matched = true
+              let snapshot = ""
+              let pidAlive = false
 
-                const key = `${info.size}:${info.mtimeMs}`
-                if (key !== snapshotKey) {
-                  snapshotRaw = await readFrom(path, 0, TAIL_BYTES)
-                  snapshotKey = key
-                }
-                snapshot = tailLines(snapshotRaw, wantedLines)
-
-                if (input.must_be_new && info.size <= baseSize) {
+              // Evaluate each condition independently and record its own reason so one failure does not hide the others.
+              if (pid !== undefined) {
+                pidAlive = processAlive(pid)
+                if (pidAlive) {
                   matched = false
-                  problems.push(`file has not grown (current ${info.size} bytes, starting ${baseSize} bytes)`)
-                } else if (regex) {
-                  // With must_be_new, match only the new range and read only that range.
-                  const from = input.must_be_new && baseSize > 0 ? baseSize : 0
-                  const scoped = from === 0 ? snapshotRaw : await readFrom(path, from, TAIL_BYTES)
-                  if (!regex.test(scoped)) {
+                  problems.push(`pid ${pid} is still running`)
+                }
+              }
+
+              // Read the log even when the pid is still alive; otherwise a timeout cannot include the log tail.
+              if (path) {
+                try {
+                  const info = await stat(path)
+                  if (info.size !== lastSize) {
+                    lastSize = info.size
+                    lastChangeAt = Date.now()
+                  }
+
+                  const key = `${info.size}:${info.mtimeMs}`
+                  if (key !== snapshotKey) {
+                    snapshotRaw = await readFrom(path, 0, TAIL_BYTES)
+                    snapshotKey = key
+                  }
+                  snapshot = tailLines(snapshotRaw, wantedLines)
+
+                  if (input.must_be_new && info.size <= baseSize) {
                     matched = false
-                    problems.push(`log did not match /${input.pattern}/`)
+                    problems.push(`file has not grown (current ${info.size} bytes, starting ${baseSize} bytes)`)
+                  } else if (regex) {
+                    // With must_be_new, match only the new range and read only that range.
+                    const from = input.must_be_new && baseSize > 0 ? baseSize : 0
+                    const scoped = from === 0 ? snapshotRaw : await readFrom(path, from, TAIL_BYTES)
+                    if (!regex.test(scoped)) {
+                      matched = false
+                      problems.push(`log did not match /${input.pattern}/`)
+                    }
+                  }
+                } catch (error) {
+                  if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+                    matched = false
+                    problems.push(`file does not exist yet: ${path}`)
+                  } else {
+                    throw error
                   }
                 }
-              } catch (error) {
-                if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-                  matched = false
-                  problems.push(`file does not exist yet: ${path}`)
-                } else {
-                  throw error
+              }
+
+              if (matched) {
+                const head = [
+                  `[wait_for] condition met after ${((Date.now() - startedAt) / 1000).toFixed(3)}s`,
+                  pid !== undefined ? `pid: ${pid} exited` : "",
+                  path ? `path: ${path}` : "",
+                ]
+                  .filter(Boolean)
+                  .join(" | ")
+                const body = snapshot ? `${head}\n\n--- log tail ---\n${compact(snapshot)}` : head
+                return buildResult("condition met", true, body)
+              }
+
+              if (Date.now() >= deadline) {
+                const head = [
+                  `[wait_for] timed out after ${(timeoutMs / 1000).toFixed(1)}s`,
+                  `Reason: ${problems.join("; ")}`,
+                  `Last change: ${((Date.now() - lastChangeAt) / 1000).toFixed(1)}s ago`,
+                  pidAlive ? `pid ${pid} is still running - the task may simply be slow, not stuck` : "",
+                  "Next step: use ps / lsof to check the process; do not call wait_for again immediately.",
+                ]
+                  .filter(Boolean)
+                  .join("\n")
+                const body = snapshot ? `${head}\n\n--- log tail ---\n${compact(snapshot)}` : head
+                return buildResult("timeout", false, body)
+              }
+
+              // Report progress before waiting. Watch events can wake the loop
+              // continuously, so a post-sleep update could starve a busy log.
+              void reportProgress(problems.join("; ") || "waiting")
+
+              if (watch === undefined && path) {
+                try {
+                  watch = await createFileWatch(path)
+                } catch {
+                  watch = null
                 }
               }
-            }
 
-            if (matched) {
-              const head = [
-                `[wait_for] condition met after ${((Date.now() - startedAt) / 1000).toFixed(3)}s`,
-                pid !== undefined ? `pid: ${pid} exited` : "",
-                path ? `path: ${path}` : "",
-              ]
-                .filter(Boolean)
-                .join(" | ")
-              const body = snapshot ? `${head}\n\n--- log tail ---\n${compact(snapshot)}` : head
-              return buildResult("condition met", true, body)
-            }
+              if (watch) {
+                const waitMs = Math.max(
+                  1,
+                  Math.min(
+                    pid !== undefined ? pollMs : Math.max(1_000, pollMs),
+                    Math.max(1, deadline - Date.now()),
+                  ),
+                )
+                let outcome: Awaited<ReturnType<FileWatch["next"]>>
+                try {
+                  outcome = await watch.next(waitMs, context?.signal)
+                } catch {
+                  watch.close()
+                  watch = null
+                  continue
+                }
+                if (outcome === "event") continue
+                if (outcome === "closed") {
+                  watch.close()
+                  watch = null
+                  continue
+                }
+                if (outcome === "aborted") {
+                  throw new Error("wait_for aborted")
+                }
+                continue
+              }
 
-            if (Date.now() >= deadline) {
-              const head = [
-                `[wait_for] timed out after ${(timeoutMs / 1000).toFixed(1)}s`,
-                `Reason: ${problems.join("; ")}`,
-                `Last change: ${((Date.now() - lastChangeAt) / 1000).toFixed(1)}s ago`,
-                pidAlive ? `pid ${pid} is still running - the task may simply be slow, not stuck` : "",
-                "Next step: use ps / lsof to check the process; do not call wait_for again immediately.",
-              ]
-                .filter(Boolean)
-                .join("\n")
-              const body = snapshot ? `${head}\n\n--- log tail ---\n${compact(snapshot)}` : head
-              return buildResult("timeout", false, body)
+              await sleep(Math.min(pollMs, Math.max(1, deadline - Date.now())))
             }
-
-            await sleep(Math.min(pollMs, Math.max(1, deadline - Date.now())))
-            void reportProgress(problems.join("; ") || "waiting")
+          } finally {
+            watch?.close()
           }
         },
       })
