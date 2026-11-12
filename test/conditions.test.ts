@@ -105,6 +105,29 @@ describe("unified conditions", () => {
     expect(result.content).toContain("ready")
   })
 
+  test("file_contains continues past the 256 KB new-content window", async () => {
+    const path = join(dir, "large-new.log")
+    await writeFile(path, "")
+    setTimeout(() => {
+      const filler = "x".repeat(280 * 1024)
+      void appendFile(path, `${filler}\nNEEDLE\n`)
+    }, 300)
+    const result = await exec(
+      {
+        condition: {
+          type: "file_contains",
+          path,
+          pattern: "NEEDLE",
+          mustBeNew: true,
+        },
+        timeout_ms: 3000,
+        poll_ms: 100,
+      },
+      noSignal,
+    )
+    expect(result.metadata.hit).toBe(true)
+  })
+
   test("process_exited waits for a process to exit", async () => {
     const child = spawn("sleep", ["0.2"], { stdio: "ignore" })
     const result = await exec(
