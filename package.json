@@ -9,6 +9,7 @@
   "files": [
     "index.ts",
     "conditions.ts",
+    "watch.ts",
     "README.md",
     "LICENSE"
   ],

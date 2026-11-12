@@ -1,5 +1,6 @@
 import { open, stat } from "node:fs/promises"
 import { normalizeCondition, runWait, type WaitResult } from "./conditions.ts"
+import { createFileWatch, type FileWatch } from "./watch.ts"
 
 /**
  * opencode-wait-for-v2 —— 给 OpenCode V2 补一个「等新输出」的原语。
@@ -18,7 +19,7 @@ import { normalizeCondition, runWait, type WaitResult } from "./conditions.ts"
  * 做法
  * ----
  * 把「等」收进一次工具调用：
- *   - 命令在内部轮询，对话只占一次
+ *   - 条件在内部等待（本地 watch 加速，远程轮询兜底），对话只占一次
  *   - 条件成立立刻返回，不傻等到 timeout
  *   - 超时不抛错，返回里带进程状态和日志尾部，让模型能判断是「慢」还是「卡死」
  *   - 支持 AbortSignal，用户按 ESC 中断会话立刻停
@@ -112,6 +113,8 @@ const DESCRIPTION = [
   "  1. 等文件出现：只给 path",
   "  2. 等日志出现某行：path + pattern（正则）",
   "  3. 等进程退出：pid",
+  "",
+  "本地文件条件会优先使用原生文件通知，并用低频轮询兜底；远程文件系统自动退回纯轮询。",
   "",
   "条件成立立刻返回，不会傻等到 timeout。超时也会正常返回（输出以 `[wait_for] timed out` 开头，",
   "并附上进程状态和日志尾部），这时应当先检查进程是否还活着，而不是再调一次 wait_for 重复等待。",
@@ -312,6 +315,10 @@ export default {
           let snapshotKey = ""
           let snapshotRaw = ""
 
+          // 首次条件检查失败后才创建 watcher。条件本来就成立时，
+          // 不必为 statfs + fs.watch 付出启动开销。
+          let watch: FileWatch | null | undefined
+
           /** 上报进度，避免阻塞期间 UI 完全没反应——那正是 sleep 轮询最糟的体验。 */
           const reportProgress = async (note: string) => {
             const now = Date.now()
@@ -342,91 +349,134 @@ export default {
             },
           })
 
-          while (true) {
-            if (context?.signal?.aborted) {
-              throw new Error("wait_for 被中止")
-            }
-
-            const problems: string[] = []
-            let matched = true
-            let snapshot = ""
-            let pidAlive = false
-
-            // 各条件独立判定、独立记录原因，避免一个条件失败就吞掉其他诊断信息
-            if (pid !== undefined) {
-              pidAlive = processAlive(pid)
-              if (pidAlive) {
-                matched = false
-                problems.push(`pid ${pid} 仍在运行`)
+          try {
+            while (true) {
+              if (context?.signal?.aborted) {
+                throw new Error("wait_for 被中止")
               }
-            }
 
-            // 注意：即使 pid 还活着也要读日志，否则超时时拿不到日志尾部
-            if (path) {
-              try {
-                const info = await stat(path)
-                if (info.size !== lastSize) {
-                  lastSize = info.size
-                  lastChangeAt = Date.now()
-                }
+              const problems: string[] = []
+              let matched = true
+              let snapshot = ""
+              let pidAlive = false
 
-                const key = `${info.size}:${info.mtimeMs}`
-                if (key !== snapshotKey) {
-                  snapshotRaw = await readFrom(path, 0, TAIL_BYTES)
-                  snapshotKey = key
-                }
-                snapshot = tailLines(snapshotRaw, wantedLines)
-
-                if (input.must_be_new && info.size <= baseSize) {
+              // 各条件独立判定、独立记录原因，避免一个条件失败就吞掉其他诊断信息
+              if (pid !== undefined) {
+                pidAlive = processAlive(pid)
+                if (pidAlive) {
                   matched = false
-                  problems.push(`文件尚未增长（当前 ${info.size} 字节，起始 ${baseSize} 字节）`)
-                } else if (regex) {
-                  // must_be_new 时只匹配新增区段，避免命中历史日志；也只读该区段
-                  const from = input.must_be_new && baseSize > 0 ? baseSize : 0
-                  const scoped = from === 0 ? snapshotRaw : await readFrom(path, from, TAIL_BYTES)
-                  if (!regex.test(scoped)) {
+                  problems.push(`pid ${pid} 仍在运行`)
+                }
+              }
+
+              // 注意：即使 pid 还活着也要读日志，否则超时时拿不到日志尾部
+              if (path) {
+                try {
+                  const info = await stat(path)
+                  if (info.size !== lastSize) {
+                    lastSize = info.size
+                    lastChangeAt = Date.now()
+                  }
+
+                  const key = `${info.size}:${info.mtimeMs}`
+                  if (key !== snapshotKey) {
+                    snapshotRaw = await readFrom(path, 0, TAIL_BYTES)
+                    snapshotKey = key
+                  }
+                  snapshot = tailLines(snapshotRaw, wantedLines)
+
+                  if (input.must_be_new && info.size <= baseSize) {
                     matched = false
-                    problems.push(`日志未匹配 /${input.pattern}/`)
+                    problems.push(`文件尚未增长（当前 ${info.size} 字节，起始 ${baseSize} 字节）`)
+                  } else if (regex) {
+                    // must_be_new 时只匹配新增区段，避免命中历史日志；也只读该区段
+                    const from = input.must_be_new && baseSize > 0 ? baseSize : 0
+                    const scoped = from === 0 ? snapshotRaw : await readFrom(path, from, TAIL_BYTES)
+                    if (!regex.test(scoped)) {
+                      matched = false
+                      problems.push(`日志未匹配 /${input.pattern}/`)
+                    }
+                  }
+                } catch (error) {
+                  if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+                    matched = false
+                    problems.push(`文件还不存在: ${path}`)
+                  } else {
+                    throw error
                   }
                 }
-              } catch (error) {
-                if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-                  matched = false
-                  problems.push(`文件还不存在: ${path}`)
-                } else {
-                  throw error
+              }
+
+              if (matched) {
+                const head = [
+                  `[wait_for] 条件成立，等待 ${((Date.now() - startedAt) / 1000).toFixed(3)}s`,
+                  pid !== undefined ? `pid: ${pid} 已退出` : "",
+                  path ? `path: ${path}` : "",
+                ]
+                  .filter(Boolean)
+                  .join(" | ")
+                const body = snapshot ? `${head}\n\n--- 日志尾部 ---\n${compact(snapshot)}` : head
+                return buildResult("condition met", true, body)
+              }
+
+              if (Date.now() >= deadline) {
+                const head = [
+                  `[wait_for] timed out 等了 ${(timeoutMs / 1000).toFixed(1)}s`,
+                  `原因: ${problems.join("；")}`,
+                  `最后变化: ${((Date.now() - lastChangeAt) / 1000).toFixed(1)}s 前`,
+                  pidAlive ? `pid ${pid} 仍在运行 —— 任务可能只是慢，不是卡死` : "",
+                  "下一步建议: 用 ps / lsof 确认进程状态，不要直接再调一次 wait_for 重复等待。",
+                ]
+                  .filter(Boolean)
+                  .join("\n")
+                const body = snapshot ? `${head}\n\n--- 日志尾部 ---\n${compact(snapshot)}` : head
+                return buildResult("timeout", false, body)
+              }
+
+              // 进度上报放在等待之前。watch 事件会不断唤醒循环，
+              // 若放在 sleep 之后，忙日志下 UI 可能长时间收不到进度。
+              void reportProgress(problems.join("；") || "等待中")
+
+              if (watch === undefined && path) {
+                try {
+                  watch = await createFileWatch(path)
+                } catch {
+                  watch = null
                 }
               }
-            }
 
-            if (matched) {
-              const head = [
-                `[wait_for] 条件成立，等待 ${((Date.now() - startedAt) / 1000).toFixed(3)}s`,
-                pid !== undefined ? `pid: ${pid} 已退出` : "",
-                path ? `path: ${path}` : "",
-              ]
-                .filter(Boolean)
-                .join(" | ")
-              const body = snapshot ? `${head}\n\n--- 日志尾部 ---\n${compact(snapshot)}` : head
-              return buildResult("condition met", true, body)
-            }
+              if (watch) {
+                const waitMs = Math.max(
+                  1,
+                  Math.min(
+                    pid !== undefined ? pollMs : Math.max(1_000, pollMs),
+                    Math.max(1, deadline - Date.now()),
+                  ),
+                )
+                let outcome: Awaited<ReturnType<FileWatch["next"]>>
+                try {
+                  outcome = await watch.next(waitMs, context?.signal)
+                } catch {
+                  watch.close()
+                  watch = null
+                  continue
+                }
+                if (outcome === "event") continue
+                if (outcome === "closed") {
+                  watch.close()
+                  watch = null
+                  continue
+                }
+                if (outcome === "aborted") {
+                  throw new Error("wait_for 被中止")
+                }
+                continue
+              }
 
-            if (Date.now() >= deadline) {
-              const head = [
-                `[wait_for] timed out 等了 ${(timeoutMs / 1000).toFixed(1)}s`,
-                `原因: ${problems.join("；")}`,
-                `最后变化: ${((Date.now() - lastChangeAt) / 1000).toFixed(1)}s 前`,
-                pidAlive ? `pid ${pid} 仍在运行 —— 任务可能只是慢，不是卡死` : "",
-                "下一步建议: 用 ps / lsof 确认进程状态，不要直接再调一次 wait_for 重复等待。",
-              ]
-                .filter(Boolean)
-                .join("\n")
-              const body = snapshot ? `${head}\n\n--- 日志尾部 ---\n${compact(snapshot)}` : head
-              return buildResult("timeout", false, body)
+              await sleep(Math.min(pollMs, Math.max(1, deadline - Date.now())))
             }
-
-            await sleep(Math.min(pollMs, Math.max(1, deadline - Date.now())))
-            void reportProgress(problems.join("；") || "等待中")
+          } finally {
+            watch?.close()
           }
         },
       })
