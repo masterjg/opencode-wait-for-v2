@@ -61,6 +61,12 @@ type EvalState = {
   initial?: { exists: boolean; size?: number; mtimeMs?: number }
   initialSize?: number
   stable?: { size: number; mtimeMs: number; since: number }
+  /** Compiled literal/regex matcher, created once per wait. */
+  matcher?: (text: string) => { matched: boolean; index: number }
+  /** Next byte offset for mustBeNew file_contains reads. */
+  cursor?: number
+  /** Parsed dot/bracket path for http_json, created once per wait. */
+  jsonParts?: string[]
 }
 
 const DEFAULT_TIMEOUT_MS = 60_000
@@ -72,6 +78,11 @@ const MAX_INTERVAL_MS = 30_000
 const TAIL_BYTES = 64 * 1024
 const NEW_BYTES = 256 * 1024
 const HTTP_BYTES = 256 * 1024
+/** Re-read this much before the cursor so regex matches can span chunks. */
+const REGEX_OVERLAP_BYTES = 4 * 1024
+/** After this long, back off polling up to MAX_BACKOFF_MS. */
+const BACKOFF_AFTER_MS = 30_000
+const MAX_BACKOFF_MS = 5_000
 
 const clamp = (value: number, min: number, max: number): number =>
   Math.max(min, Math.min(max, Math.trunc(value)))
@@ -265,17 +276,24 @@ export function describeCondition(condition: WaitCondition): string {
   }
 }
 
-export function jsonPath(value: unknown, pathText: string): unknown {
-  const parts = pathText
+export function jsonPathParts(pathText: string): string[] {
+  return pathText
     .replace(/\[(\d+)\]/g, ".$1")
     .split(".")
     .filter(Boolean)
+}
+
+export function jsonPathFromParts(value: unknown, parts: readonly string[]): unknown {
   let current: any = value
   for (const part of parts) {
     if (current === null || current === undefined) return undefined
     current = current[part]
   }
   return current
+}
+
+export function jsonPath(value: unknown, pathText: string): unknown {
+  return jsonPathFromParts(value, jsonPathParts(pathText))
 }
 
 export function sameJson(actual: unknown, expected: unknown): boolean {
@@ -344,6 +362,7 @@ export function portOpen(host: string, port: number, timeoutMs = 2_000): Promise
     socket.once("connect", () => finish(true))
     socket.once("timeout", () => finish(false))
     socket.once("error", () => finish(false))
+    socket.once("close", () => finish(false))
   })
 }
 
@@ -375,12 +394,16 @@ async function statMaybe(fullPath: string) {
   }
 }
 
-async function readRange(fullPath: string, start: number, length: number): Promise<string> {
+async function readRange(
+  fullPath: string,
+  start: number,
+  length: number,
+): Promise<{ text: string; bytesRead: number }> {
   const handle = await fs.open(fullPath, "r")
   try {
     const buffer = Buffer.alloc(Math.max(0, length))
     const { bytesRead } = await handle.read(buffer, 0, buffer.length, start)
-    return buffer.subarray(0, bytesRead).toString("utf8")
+    return { text: buffer.subarray(0, bytesRead).toString("utf8"), bytesRead }
   } finally {
     await handle.close()
   }
@@ -410,6 +433,12 @@ function limitJson(value: unknown, max = 2_000): unknown {
   const text = JSON.stringify(value)
   if (text.length <= max) return value
   return `${text.slice(0, max)}…`
+}
+
+/** Serialize large JSON observations only when a wait result is returned. */
+function summarizeObserved(observed: Record<string, unknown>): Record<string, unknown> {
+  if (!("value" in observed)) return observed
+  return { ...observed, value: limitJson(observed.value) }
 }
 
 async function readLimited(response: Response, maxBytes: number): Promise<string> {
@@ -450,6 +479,13 @@ async function fetchOnce(
     redirect: "follow",
     signal: combinedSignal(signal, timeoutMs),
   })
+}
+
+/** Drain an unused response body so undici can reuse the connection. */
+async function discardBody(response: Response): Promise<void> {
+  try {
+    await response.body?.cancel()
+  } catch {}
 }
 
 async function evaluate(
@@ -579,15 +615,27 @@ async function evaluate(
       }
 
       if (state.initialSize === undefined) state.initialSize = stat.size
-      if (stat.size < state.initialSize) state.initialSize = 0
+      if (stat.size < state.initialSize) {
+        state.initialSize = 0
+        state.cursor = 0
+      }
+      state.matcher ??= patternMatcher(condition.pattern, condition.regex)
+      if (condition.mustBeNew && state.cursor === undefined) state.cursor = state.initialSize
 
       const start = condition.mustBeNew
-        ? Math.max(state.initialSize, stat.size - NEW_BYTES)
+        ? Math.max(state.cursor ?? state.initialSize, 0)
         : Math.max(0, stat.size - TAIL_BYTES)
       const length = Math.min(condition.mustBeNew ? NEW_BYTES : TAIL_BYTES, stat.size - start)
-      const text = length > 0 ? await readRange(fullPath, start, length) : ""
-      const match = patternMatcher(condition.pattern, condition.regex)(text)
+      const read = length > 0 ? await readRange(fullPath, start, length) : { text: "", bytesRead: 0 }
+      const text = read.text
+      const match = state.matcher(text)
       if (!match.matched) {
+        if (condition.mustBeNew && read.bytesRead > 0) {
+          const overlap = condition.regex
+            ? REGEX_OVERLAP_BYTES
+            : Math.max(0, condition.pattern.length - 1)
+          state.cursor = Math.max(start, start + read.bytesRead - overlap)
+        }
         return {
           matched: false,
           observed: {
@@ -634,6 +682,7 @@ async function evaluate(
       const perAttempt = Math.max(2_000, Math.min(10_000, intervalMs))
       try {
         const response = await fetchOnce(condition.url, condition.headers, options.signal, perAttempt)
+        await discardBody(response)
         const expected = condition.status === undefined
           ? response.status >= 200 && response.status < 300
           : Array.isArray(condition.status)
@@ -657,6 +706,7 @@ async function evaluate(
       try {
         const response = await fetchOnce(condition.url, condition.headers, options.signal, perAttempt)
         if (response.status < 200 || response.status >= 300) {
+          await discardBody(response)
           return {
             matched: false,
             observed: { url: condition.url, status: response.status },
@@ -673,13 +723,14 @@ async function evaluate(
             error: "response is not valid JSON",
           }
         }
-        const actual = jsonPath(body, condition.jsonPath)
+        state.jsonParts ??= jsonPathParts(condition.jsonPath)
+        const actual = jsonPathFromParts(body, state.jsonParts)
         return {
           matched: sameJson(actual, condition.equals),
           observed: {
             url: condition.url,
             status: response.status,
-            value: limitJson(actual),
+            value: actual,
           },
         }
       } catch (error) {
@@ -696,13 +747,15 @@ async function evaluate(
       try {
         const response = await fetchOnce(condition.url, condition.headers, options.signal, perAttempt)
         if (response.status < 200 || response.status >= 300) {
+          await discardBody(response)
           return {
             matched: false,
             observed: { url: condition.url, status: response.status },
           }
         }
         const text = await readLimited(response, HTTP_BYTES)
-        const match = patternMatcher(condition.pattern, condition.regex)(text)
+        state.matcher ??= patternMatcher(condition.pattern, condition.regex)
+        const match = state.matcher(text)
         return {
           matched: match.matched,
           observed: { url: condition.url, status: response.status },
@@ -745,6 +798,7 @@ export async function runWait(condition: WaitCondition, options: WaitOptions): P
   let attempts = 0
   let last: EvalResult = { matched: false, observed: {} }
   let lastProgress = 0
+  let delay = intervalMs
 
   while (true) {
     if (options.signal?.aborted) {
@@ -755,7 +809,7 @@ export async function runWait(condition: WaitCondition, options: WaitOptions): P
         condition: describeCondition(condition),
         elapsedMs: Date.now() - started,
         attempts,
-        observed: last.observed,
+        observed: summarizeObserved(last.observed),
         ...(last.excerpt ? { excerpt: last.excerpt } : {}),
         ...(last.error ? { lastError: last.error } : {}),
       }
@@ -772,7 +826,7 @@ export async function runWait(condition: WaitCondition, options: WaitOptions): P
         condition: describeCondition(condition),
         elapsedMs: Date.now() - started,
         attempts,
-        observed: last.observed,
+        observed: summarizeObserved(last.observed),
         ...(last.excerpt ? { excerpt: last.excerpt } : {}),
       }
     }
@@ -786,7 +840,7 @@ export async function runWait(condition: WaitCondition, options: WaitOptions): P
         condition: describeCondition(condition),
         elapsedMs: elapsed,
         attempts,
-        observed: last.observed,
+        observed: summarizeObserved(last.observed),
         ...(last.excerpt ? { excerpt: last.excerpt } : {}),
         ...(last.error ? { lastError: last.error } : {}),
       }
@@ -795,14 +849,21 @@ export async function runWait(condition: WaitCondition, options: WaitOptions): P
     if (options.progress && Date.now() - lastProgress >= 1_000) {
       lastProgress = Date.now()
       try {
-        await options.progress({
-          status: `waiting for ${describeCondition(condition)} (${Math.round(elapsed / 1000)}s)`,
-        })
+        // Do not let a slow UI progress update delay the next condition check.
+        void Promise.resolve(
+          options.progress({
+            status: `waiting for ${describeCondition(condition)} (${Math.round(elapsed / 1000)}s)`,
+          }),
+        ).catch(() => {})
       } catch {}
     }
 
+    if (elapsed > BACKOFF_AFTER_MS) {
+      delay = Math.min(MAX_BACKOFF_MS, Math.max(intervalMs, delay * 2))
+    }
+
     try {
-      await sleep(Math.min(intervalMs, timeoutMs - elapsed), options.signal)
+      await sleep(Math.min(delay, timeoutMs - elapsed), options.signal)
     } catch {
       return {
         matched: false,
@@ -811,7 +872,7 @@ export async function runWait(condition: WaitCondition, options: WaitOptions): P
         condition: describeCondition(condition),
         elapsedMs: Date.now() - started,
         attempts,
-        observed: last.observed,
+        observed: summarizeObserved(last.observed),
         ...(last.excerpt ? { excerpt: last.excerpt } : {}),
         ...(last.error ? { lastError: last.error } : {}),
       }

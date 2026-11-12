@@ -309,6 +309,8 @@ export default {
           let lastSize = -1
           let lastChangeAt = startedAt
           let lastProgressAt = 0
+          let snapshotKey = ""
+          let snapshotRaw = ""
 
           /** 上报进度，避免阻塞期间 UI 完全没反应——那正是 sleep 轮询最糟的体验。 */
           const reportProgress = async (note: string) => {
@@ -368,7 +370,12 @@ export default {
                   lastChangeAt = Date.now()
                 }
 
-                snapshot = tailLines(await readFrom(path, 0, TAIL_BYTES), wantedLines)
+                const key = `${info.size}:${info.mtimeMs}`
+                if (key !== snapshotKey) {
+                  snapshotRaw = await readFrom(path, 0, TAIL_BYTES)
+                  snapshotKey = key
+                }
+                snapshot = tailLines(snapshotRaw, wantedLines)
 
                 if (input.must_be_new && info.size <= baseSize) {
                   matched = false
@@ -376,7 +383,7 @@ export default {
                 } else if (regex) {
                   // must_be_new 时只匹配新增区段，避免命中历史日志；也只读该区段
                   const from = input.must_be_new && baseSize > 0 ? baseSize : 0
-                  const scoped = await readFrom(path, from, TAIL_BYTES)
+                  const scoped = from === 0 ? snapshotRaw : await readFrom(path, from, TAIL_BYTES)
                   if (!regex.test(scoped)) {
                     matched = false
                     problems.push(`日志未匹配 /${input.pattern}/`)
@@ -419,7 +426,7 @@ export default {
             }
 
             await sleep(Math.min(pollMs, Math.max(1, deadline - Date.now())))
-            await reportProgress(problems.join("；") || "等待中")
+            void reportProgress(problems.join("；") || "等待中")
           }
         },
       })
