@@ -150,7 +150,7 @@ Wait for a CI run:
 await tools.wait.for({
   condition: {
     type: "http_json",
-    url: "https://api.github.com/repos/masterjg/opencode-fs-plugin/actions/runs/43231442916",
+    url: "https://api.github.com/repos/org/repo/actions/runs/123",
     jsonPath: "status",
     equals: "completed",
   },

@@ -37,10 +37,10 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/masterjg/opencode-wait-for-v2.git"
+    "url": "git+https://github.com/lcssos/opencode-wait-for-v2.git"
   },
-  "homepage": "https://github.com/masterjg/opencode-wait-for-v2#readme",
+  "homepage": "https://github.com/lcssos/opencode-wait-for-v2#readme",
   "bugs": {
-    "url": "https://github.com/masterjg/opencode-wait-for-v2/issues"
+    "url": "https://github.com/lcssos/opencode-wait-for-v2/issues"
   }
 }

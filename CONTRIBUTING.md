@@ -11,7 +11,7 @@ Thanks for taking the time to improve `opencode-wait-for-v2`. This document cove
 ## Setup
 
 ```bash
-git clone git@github.com:masterjg/opencode-wait-for-v2.git
+git clone https://github.com/lcssos/opencode-wait-for-v2.git
 cd opencode-wait-for-v2
 bun install
 bun test

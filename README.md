@@ -3,17 +3,12 @@
 Condition, log-line, and process waiting for OpenCode. In Code Mode the tool is
 `tools.wait.for`; it replaces guessed `sleep N` delays and manual `tail` polling.
 
-This is a fork of
-[`lcssos/opencode-wait-for-v2`](https://github.com/lcssos/opencode-wait-for-v2)
-(MIT), merged with the local namespace, permission checks, and OpenCode V2
-integration.
-
 ## Install
 
 Plugin:
 
 ```bash
-git clone git@github.com:masterjg/opencode-wait-for-v2.git \
+git clone https://github.com/lcssos/opencode-wait-for-v2.git \
   ~/.config/opencode/repos/opencode-wait-for-v2
 ```
 

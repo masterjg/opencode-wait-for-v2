@@ -6,7 +6,7 @@ All notable changes to this project are documented here. The format is based on 
 
 ### Added
 
-- Local namespace integration: `tools.wait.for` with project-root and `external_directory` permission checks.
+- Code Mode namespace `tools.wait.for` with project-root and `external_directory` permission checks.
 - Bundled `skills/wait/SKILL.md` and install instructions.
 
 ## [0.2.0] - 2026-11-14
