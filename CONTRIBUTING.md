@@ -23,10 +23,10 @@ bun test
 
 | File | Responsibility |
 | --- | --- |
-| `index.ts` | The `wait_for` tool: input schema, legacy `path` / `pattern` / `pid` waiting, progress reporting, result formatting. |
-| `conditions.ts` | Unified `condition` API: normalization, per-type checks, polling loop (`runWait`), metadata and timeout reporting. |
-| `test/wait-for.test.ts` | Legacy log/pid waiting, progress, interruption. |
-| `test/conditions.test.ts` | Every condition type, timeout semantics, abort handling. |
+| `index.ts` | The `tools.wait.for` tool: namespace, project-root/permission checks, input schema, progress reporting, result formatting. |
+| `wait.ts` | Unified `condition` API: normalization, per-type checks, polling loop, metadata and timeout reporting. |
+| `wait.test.ts` | Legacy log/pid waiting, progress, interruption, and every condition type. |
+| `skills/wait/SKILL.md` | Bundled agent skill: conditions, defaults, limits, and permission behavior. |
 | `scripts/release.sh` | Version bump, commit, tag, push (maintainers only). |
 
 ## Making changes

@@ -1,76 +1,154 @@
 import { open, stat } from "node:fs/promises"
-import { normalizeCondition, runWait, type WaitResult } from "./conditions.ts"
-
-/**
- * opencode-wait-for-v2 - a "wait for new output" primitive for OpenCode V2.
- *
- * Problem
- * -------
- * OpenCode's built-in shell tool returns only when the command finishes: the
- * whole conversation blocks during a long task, the UI shows no progress, and
- * the model spends another reasoning turn after it ends (P50 ~14s locally).
- *
- * It also has no "wait for a new log line" capability, so the model has to
- * build polling loops by hand:
- *
- *     sleep 60; tail -c 800 build.log | tail -12; ps -Ao pid,command | grep ...
- *
- * A long task often needs a dozen polls, each waiting a guessed number of
- * seconds and then reasoning again.
- *
- * Approach
- * --------
- * Put the wait into one tool call:
- *   - the command polls internally; the conversation uses one call
- *   - return as soon as the condition holds, not at the timeout
- *   - timeouts do not throw; return process state and the log tail so the
- *     model can tell "slow" from "stuck"
- *   - support AbortSignal so ESC stops the wait immediately
- *
- * This mirrors Codex CLI's `write_stdin` / `clock.sleep` design:
- * one blocking call, interruptible, returning output produced so far.
- */
+import * as path from "node:path"
+import { Plugin } from "@opencode/plugin"
+import { normalizeCondition, runWait } from "./wait.ts"
 
 const DEFAULT_TIMEOUT_MS = 240_000
 const MAX_TIMEOUT_MS = 600_000
 const DEFAULT_POLL_MS = 500
 const MIN_POLL_MS = 100
-
-/** Watch only this many bytes of the file tail; avoids loading tens of MB of build logs. */
 const TAIL_BYTES = 64 * 1024
-
-/** Maximum log text returned to the model; keep the tail when longer. */
 const MAX_OUTPUT_CHARS = 4_000
-
-/** Throttle progress updates to avoid flooding the UI. */
 const PROGRESS_INTERVAL_MS = 1_000
 
-interface WaitForInput {
-  path?: string
-  pattern?: string
-  pid?: number
-  timeout_ms?: number
-  poll_ms?: number
-  tail_lines?: number
-  must_be_new?: boolean
-  condition?: unknown
+const CONDITION_TYPES = [
+  "file_exists",
+  "file_absent",
+  "file_changed",
+  "file_contains",
+  "process_exited",
+  "process_running",
+  "port_open",
+  "port_closed",
+  "http_status",
+  "http_json",
+  "http_body_contains",
+] as const
+
+const INPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    condition: {
+      type: "object",
+      description:
+        "Advanced condition. When set, path/pattern/pid/must_be_new are ignored. Set type, then the fields that type needs. File paths are relative to the project unless absolute; absolute paths outside the project require external_directory permission.",
+      properties: {
+        type: { type: "string", enum: [...CONDITION_TYPES] },
+        path: { type: "string", description: "File path for file_exists, file_absent, file_changed, or file_contains." },
+        pattern: {
+          type: "string",
+          description: "Literal text or regular expression for file_contains or http_body_contains.",
+        },
+        regex: { type: "boolean", description: "Treat pattern as a regular expression. Default false." },
+        mustBeNew: {
+          type: "boolean",
+          description: "For file_contains: only match content appended after this call starts. Default false.",
+        },
+        since: {
+          type: "number",
+          description: "For file_changed: epoch milliseconds; match when mtime is newer. Defaults to the file state at call start.",
+        },
+        stableForMs: {
+          type: "number",
+          description: "For file_exists or file_changed: require the size and mtime to stay unchanged for this many milliseconds.",
+        },
+        pid: { type: "integer", description: "Process ID for process_exited or process_running." },
+        host: { type: "string", description: "Host for port_open or port_closed." },
+        port: { type: "integer", description: "TCP port for port_open or port_closed." },
+        url: { type: "string", description: "http:// or https:// URL for HTTP conditions." },
+        status: {
+          anyOf: [{ type: "number" }, { type: "array", items: { type: "number" } }],
+          description: "For http_status: expected status code or codes. Default any 2xx.",
+        },
+        headers: {
+          type: "object",
+          additionalProperties: { type: "string" },
+          description: "Optional request headers for HTTP conditions.",
+        },
+        jsonPath: {
+          type: "string",
+          description: "For http_json: dot/bracket path into the response, for example 'status' or 'jobs[0].status'.",
+        },
+        equals: {
+          description: "For http_json: expected value at jsonPath. Strings compare to numbers/booleans by string form.",
+        },
+      },
+      required: ["type"],
+      additionalProperties: false,
+    },
+    path: {
+      type: "string",
+      description: "File to watch. Relative paths resolve against the project; absolute paths outside it require external_directory permission.",
+    },
+    pattern: {
+      type: "string",
+      description: "Regular expression for a log line. Requires path. Only the last 64 KB is watched.",
+    },
+    pid: { type: "integer", description: "Wait for this process to exit. Can be combined with path." },
+    timeout_ms: {
+      type: "integer",
+      minimum: 100,
+      maximum: MAX_TIMEOUT_MS,
+      description: `Maximum wait in milliseconds. Default ${DEFAULT_TIMEOUT_MS}.`,
+    },
+    poll_ms: {
+      type: "integer",
+      minimum: MIN_POLL_MS,
+      maximum: 30_000,
+      description: `Poll interval in milliseconds. Default ${DEFAULT_POLL_MS}.`,
+    },
+    tail_lines: { type: "integer", minimum: 1, description: "Trailing log lines returned. Default 60." },
+    must_be_new: {
+      type: "boolean",
+      description: "Only content written after the call starts counts. Useful when the log already contains an old match.",
+    },
+    timeoutMs: {
+      type: "integer",
+      minimum: 100,
+      maximum: MAX_TIMEOUT_MS,
+      description: "Alias for timeout_ms.",
+    },
+    intervalMs: {
+      type: "integer",
+      minimum: MIN_POLL_MS,
+      maximum: 30_000,
+      description: "Alias for poll_ms.",
+    },
+  },
+  required: [],
+  additionalProperties: false,
+} as const
+
+const DESCRIPTION = [
+  "Wait for a real condition instead of fixed sleep loops. Checks immediately, then polls until the condition matches or the timeout expires.",
+  "",
+  "Four ways to use it:",
+  "  1. Wait for a file to appear: pass only path",
+  "  2. Wait for a log line: path + pattern (regular expression)",
+  "  3. Wait for a process to exit: pid",
+  "  4. Wait for an advanced condition: condition (file, process, port, or HTTP). condition takes precedence over 1-3.",
+  "",
+  "Conditions: file_exists, file_absent, file_changed, file_contains (log lines, optional mustBeNew), process_exited, process_running, port_open, port_closed, http_status, http_json (dot-path equals), http_body_contains.",
+  "Returns immediately when the condition holds; a timeout is a normal result, not a thrown error. File paths respect external_directory permissions.",
+].join("\n")
+
+function slash(value: string): string {
+  return value.split(path.sep).join("/")
 }
 
-/**
- * Read from `from` to EOF in one open/read pass, up to maxBytes.
- *
- * Do not use readFile: build logs are often tens of MB, and reading the whole
- * file is slow and memory-heavy. The window starts at max(from, size - maxBytes)
- * so it never starts before `from` and never exceeds the byte budget.
- */
-async function readFrom(path: string, from: number, maxBytes: number): Promise<string> {
-  const info = await stat(path)
-  if (!info.isFile()) throw new Error(`${path} is not a regular file`)
+function outsideRoot(root: string, fullPath: string): boolean {
+  const relative = path.relative(root, fullPath)
+  return relative !== "" && (relative.startsWith("..") || path.isAbsolute(relative))
+}
+
+async function readFrom(fullPath: string, from: number, maxBytes: number): Promise<string> {
+  const info = await stat(fullPath)
+  if (!info.isFile()) throw new Error(`${fullPath} is not a regular file`)
   if (info.size <= from) return ""
 
   const start = Math.max(from, info.size - maxBytes)
   const length = info.size - start
-  const handle = await open(path, "r")
+  const handle = await open(fullPath, "r")
   try {
     const buffer = Buffer.alloc(length)
     let offset = 0
@@ -85,20 +163,17 @@ async function readFrom(path: string, from: number, maxBytes: number): Promise<s
   }
 }
 
-/** Keep only the last n lines so the model does not receive the whole log tail. */
 function tailLines(text: string, lines: number): string {
   const all = text.split("\n")
   if (all.length <= lines) return text
   return all.slice(all.length - lines).join("\n")
 }
 
-/** Keep the tail when text is too long - the conclusion is usually at the end. */
 function compact(text: string, limit = MAX_OUTPUT_CHARS): string {
   if (text.length <= limit) return text
   return `...(omitted ${text.length - limit} chars)...\n${text.slice(text.length - limit)}`
 }
 
-/** Whether the process is alive. EPERM means it exists but belongs to another user, so it is alive too. */
 function processAlive(pid: number): boolean {
   try {
     process.kill(pid, 0)
@@ -110,219 +185,113 @@ function processAlive(pid: number): boolean {
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
 
-const DESCRIPTION = [
-  "Block until a condition holds, up to timeout_ms. Use this instead of foreground `sleep N; tail ...` polling.",
-  "",
-  "Four ways to use it:",
-  "  1. Wait for a file to appear: pass only path",
-  "  2. Wait for a log line: path + pattern (regular expression)",
-  "  3. Wait for a process to exit: pid",
-  "  4. Wait for an advanced condition: condition (file, process, port, or HTTP). When set, it takes precedence over 1-3.",
-  "",
-  "Ways 1-3 can be combined; all of them must hold. condition.type is one of: file_exists, file_absent, file_changed,",
-  "file_contains, process_exited, process_running, port_open, port_closed, http_status, http_json, http_body_contains.",
-  "Put the fields next to type, e.g. condition: { type: 'port_open', host: '127.0.0.1', port: 3000 }",
-  "or condition: { type: 'http_status', url: 'https://...', status: 200 }.",
-  "",
-  "Returns as soon as the condition holds; does not wait for the timeout. A timeout also returns normally (output starts with `[wait_for] timed out`,",
-  "with process state and the log tail attached). When that happens, check whether the process is still alive instead of calling wait_for again immediately.",
-  "",
-  "Typical cases:",
-  "  - Start a long task with shell's background: true and redirect it to a log, then wait for an end marker:",
-  "      path: '/tmp/build.log', pattern: 'BUILD (SUCCESS|FAILURE)'",
-  "  - Wait for a port: path: '/tmp/dev.log', pattern: 'listening on'",
-  "  - Wait for a background process to exit: pid: 12345",
-  "  - Wait for an HTTP endpoint, port, or CI status: condition: { type: 'port_open', host: '127.0.0.1', port: 3000 }",
-  "",
-  "The result is the log tail at match time (or timeout), so no separate tail is needed.",
-].join("\n")
+export default Plugin.define({
+  id: "wait",
+  async setup(ctx) {
+    const root = path.resolve(
+      (typeof ctx.options?.root === "string" && ctx.options.root) ||
+        ctx.location?.project?.canonical ||
+        ctx.location?.directory ||
+        process.cwd(),
+    )
 
-function conditionResult(result: WaitResult) {
-  const seconds = (result.elapsedMs / 1000).toFixed(result.matched ? 3 : 1)
-  const lines = result.matched
-    ? [`[wait_for] condition met after ${seconds}s`, `condition: ${result.condition}`, `attempts: ${result.attempts}`]
-    : result.aborted
-      ? [`[wait_for] aborted after ${seconds}s`, `condition: ${result.condition}`, `attempts: ${result.attempts}`]
-      : [
-          `[wait_for] timed out after ${seconds}s`,
-          `condition: ${result.condition}`,
-          `attempts: ${result.attempts}`,
-          `last error: ${result.lastError ?? "none"}`,
-          "Next step: inspect the observed state; do not call wait_for again immediately.",
-        ]
-  if (result.excerpt) lines.push("", "--- log tail ---", compact(result.excerpt))
-  lines.push(`observed: ${JSON.stringify(result.observed)}`)
-  return {
-    content: lines.join("\n"),
-    metadata: {
-      reason: result.matched ? "condition met" : result.aborted ? "aborted" : "timeout",
-      hit: result.matched,
-      waited_ms: result.elapsedMs,
-      attempts: result.attempts,
-      observed: result.observed,
-      ...(result.excerpt ? { excerpt: result.excerpt } : {}),
-    },
-  }
-}
+    await ctx.tool.transform((editor) => {
+      editor.namespace({
+        name: "wait",
+        description: "Wait for filesystem, process, port, or HTTP conditions without shell sleep loops.",
+      })
 
-export default {
-  id: "wait-for",
-
-  async setup(ctx: any) {
-    const registration = await ctx.tool.transform((editor: any) => {
       editor.add({
-        name: "wait_for",
+        name: "for",
         description: DESCRIPTION,
-        input: {
-          type: "object",
-          properties: {
-            condition: {
-              type: "object",
-              description:
-                "Advanced condition for file, process, port, or HTTP state. When set, path/pattern/pid/must_be_new are ignored. Set type, then the fields that type needs (e.g. path, pid, host+port, url, status, jsonPath+equals).",
-              properties: {
-                type: {
-                  type: "string",
-                  enum: [
-                    "file_exists",
-                    "file_absent",
-                    "file_changed",
-                    "file_contains",
-                    "process_exited",
-                    "process_running",
-                    "port_open",
-                    "port_closed",
-                    "http_status",
-                    "http_json",
-                    "http_body_contains",
-                  ],
-                },
-                path: { type: "string" },
-                pattern: { type: "string" },
-                regex: { type: "boolean" },
-                mustBeNew: { type: "boolean" },
-                since: { type: "number" },
-                stableForMs: { type: "number" },
-                pid: { type: "number" },
-                host: { type: "string" },
-                port: { type: "number" },
-                url: { type: "string" },
-                status: {
-                  anyOf: [{ type: "number" }, { type: "array", items: { type: "number" } }],
-                },
-                headers: {
-                  type: "object",
-                  additionalProperties: { type: "string" },
-                },
-                jsonPath: { type: "string" },
-                equals: {},
-              },
-              required: ["type"],
-              additionalProperties: false,
-            },
-            path: {
-              type: "string",
-              description: "File to watch (absolute path). Usually a log written by a background shell.",
-            },
-            pattern: {
-              type: "string",
-              description:
-                "Regular expression. The condition holds when the file content matches. Only the last 64 KB is watched, so do not expect very old content. Requires path.",
-            },
-            pid: {
-              type: "number",
-              description: "Wait for this process to exit instead. Can be combined with path, in which case both the exit and the log match must hold.",
-            },
-            timeout_ms: {
-              type: "number",
-              description: `Maximum wait in milliseconds. Default ${DEFAULT_TIMEOUT_MS}, cap ${MAX_TIMEOUT_MS}.`,
-            },
-            poll_ms: {
-              type: "number",
-              description: `Poll interval in milliseconds. Default ${DEFAULT_POLL_MS}, minimum ${MIN_POLL_MS}. Usually not needed.`,
-            },
-            tail_lines: {
-              type: "number",
-              description: "Number of trailing log lines to return. Default 60.",
-            },
-            must_be_new: {
-              type: "boolean",
-              description:
-                "When true, only content written after the call starts counts (the current file size is recorded first). Useful when the log already contains an old match.",
-            },
-          },
-          required: [],
-          additionalProperties: false,
-        },
-        options: { codemode: true },
-        execute: async (raw: WaitForInput, context: any) => {
-          const input = raw ?? {}
+        input: INPUT_SCHEMA,
+        options: { namespace: "wait", codemode: true, permission: "wait_for" },
+        execute: async (input: any, context: any) => {
+          const data = input ?? {}
+          const timeoutMs = data.timeout_ms ?? data.timeoutMs
+          const pollMs = data.poll_ms ?? data.intervalMs
 
-          if (input.condition) {
-            const condition = normalizeCondition(input.condition)
+          const assertExternal = async (fullPath: string) => {
+            if (!outsideRoot(root, fullPath)) return
+            const assert = (ctx as any).permission?.assert
+            if (typeof assert !== "function") {
+              throw new Error("wait_for: permission API is unavailable; refusing to read outside the project")
+            }
+            await assert({
+              sessionID: context?.sessionID,
+              agent: context?.agent,
+              source: {
+                type: "tool",
+                messageID: context?.messageID,
+                id: context?.id,
+              },
+              action: "external_directory",
+              resources: [`${slash(path.dirname(fullPath))}/*`],
+              save: [`${slash(root)}/*`],
+            })
+          }
+
+          if (data.condition) {
+            const condition = normalizeCondition(data.condition)
             const result = await runWait(condition, {
-              root: context?.directory ?? process.cwd(),
-              timeoutMs: input.timeout_ms,
-              intervalMs: input.poll_ms,
+              root,
+              timeoutMs,
+              intervalMs: pollMs,
               signal: context?.signal,
-              // Keep the upstream plugin's existing behavior: absolute paths are
-              // accepted without the host permission API. The local fork adds
-              // external_directory checks separately.
-              assertExternal: async () => {},
+              assertExternal,
               progress: context?.progress
-                ? async (event: { status: string }) => {
-                    try {
-                      await context.progress({ status: "waiting", note: event.status })
-                    } catch {}
-                  }
+                ? (event: { status: string }) => context.progress(event)
                 : undefined,
             })
-            return conditionResult(result)
+            return { content: JSON.stringify(result, null, 2) }
           }
 
-          const path = input.path
-          const pid = typeof input.pid === "number" ? input.pid : undefined
+          const rawPath = typeof data.path === "string" && data.path.trim() ? data.path.trim() : undefined
+          const pid = typeof data.pid === "number" ? data.pid : undefined
 
-          if (input.pattern && !path) {
-            throw new Error("pattern requires path")
-          }
-          if (!path && pid === undefined) {
-            throw new Error("wait_for requires at least one of path or pid")
+          if (data.pattern && !rawPath) throw new Error("wait_for: pattern requires path")
+          if (!rawPath && pid === undefined) {
+            throw new Error("wait_for requires at least one of condition, path, or pid")
           }
 
-          const timeoutMs = Math.min(
-            Math.max(1, Math.floor(input.timeout_ms ?? DEFAULT_TIMEOUT_MS)),
+          const fullPath = rawPath
+            ? path.isAbsolute(rawPath)
+              ? path.normalize(rawPath)
+              : path.resolve(root, rawPath)
+            : undefined
+          if (fullPath) await assertExternal(fullPath)
+
+          const waitTimeout = Math.min(
+            Math.max(1, Math.floor(timeoutMs ?? DEFAULT_TIMEOUT_MS)),
             MAX_TIMEOUT_MS,
           )
-          const pollMs = Math.max(MIN_POLL_MS, Math.floor(input.poll_ms ?? DEFAULT_POLL_MS))
-          const wantedLines = Math.max(1, Math.floor(input.tail_lines ?? 60))
+          const pollInterval = Math.max(MIN_POLL_MS, Math.floor(pollMs ?? DEFAULT_POLL_MS))
+          const wantedLines = Math.max(1, Math.floor(data.tail_lines ?? 60))
 
           let regex: RegExp | undefined
-          if (input.pattern) {
+          if (data.pattern) {
             try {
-              regex = new RegExp(input.pattern, "m")
+              regex = new RegExp(data.pattern, "m")
             } catch (error) {
-              throw new Error(`pattern is not a valid regular expression: ${(error as Error).message}`)
+              throw new Error(`wait_for: pattern is not a valid regular expression: ${(error as Error).message}`)
             }
           }
 
-          // must_be_new: record the starting size and only consider new content
           let baseSize = 0
-          if (path && input.must_be_new) {
+          if (fullPath && data.must_be_new) {
             try {
-              baseSize = (await stat(path)).size
+              baseSize = (await stat(fullPath)).size
             } catch {
               baseSize = 0
             }
           }
 
           const startedAt = Date.now()
-          const deadline = startedAt + timeoutMs
+          const deadline = startedAt + waitTimeout
           let lastSize = -1
           let lastChangeAt = startedAt
           let lastProgressAt = 0
 
-          /** Report progress so the UI does not appear frozen during the wait - the worst part of sleep polling. */
           const reportProgress = async (note: string) => {
             const now = Date.now()
             if (now - lastProgressAt < PROGRESS_INTERVAL_MS) return
@@ -334,9 +303,7 @@ export default {
                 idle_ms: now - lastChangeAt,
                 note,
               })
-            } catch {
-              // A failed progress update must not affect the wait itself
-            }
+            } catch {}
           }
 
           const buildResult = (reason: string, hit: boolean, body: string) => ({
@@ -345,24 +312,20 @@ export default {
               reason,
               hit,
               waited_ms: Date.now() - startedAt,
-              // Time since the last content change - distinguishes "slow" from "stuck".
               idle_ms: Date.now() - lastChangeAt,
-              ...(path ? { path } : {}),
+              ...(fullPath ? { path: fullPath } : {}),
               ...(pid !== undefined ? { pid } : {}),
             },
           })
 
           while (true) {
-            if (context?.signal?.aborted) {
-              throw new Error("wait_for aborted")
-            }
+            if (context?.signal?.aborted) throw new Error("wait_for aborted")
 
             const problems: string[] = []
             let matched = true
             let snapshot = ""
             let pidAlive = false
 
-            // Evaluate each condition independently and record its own reason so one failure does not hide the others.
             if (pid !== undefined) {
               pidAlive = processAlive(pid)
               if (pidAlive) {
@@ -371,33 +334,31 @@ export default {
               }
             }
 
-            // Read the log even when the pid is still alive; otherwise a timeout cannot include the log tail.
-            if (path) {
+            if (fullPath) {
               try {
-                const info = await stat(path)
+                const info = await stat(fullPath)
                 if (info.size !== lastSize) {
                   lastSize = info.size
                   lastChangeAt = Date.now()
                 }
 
-                snapshot = tailLines(await readFrom(path, 0, TAIL_BYTES), wantedLines)
+                snapshot = tailLines(await readFrom(fullPath, 0, TAIL_BYTES), wantedLines)
 
-                if (input.must_be_new && info.size <= baseSize) {
+                if (data.must_be_new && info.size <= baseSize) {
                   matched = false
                   problems.push(`file has not grown (current ${info.size} bytes, starting ${baseSize} bytes)`)
                 } else if (regex) {
-                  // With must_be_new, match only the new range and read only that range.
-                  const from = input.must_be_new && baseSize > 0 ? baseSize : 0
-                  const scoped = await readFrom(path, from, TAIL_BYTES)
+                  const from = data.must_be_new && baseSize > 0 ? baseSize : 0
+                  const scoped = await readFrom(fullPath, from, TAIL_BYTES)
                   if (!regex.test(scoped)) {
                     matched = false
-                    problems.push(`log did not match /${input.pattern}/`)
+                    problems.push(`log did not match /${data.pattern}/`)
                   }
                 }
               } catch (error) {
                 if ((error as NodeJS.ErrnoException).code === "ENOENT") {
                   matched = false
-                  problems.push(`file does not exist yet: ${path}`)
+                  problems.push(`file does not exist yet: ${fullPath}`)
                 } else {
                   throw error
                 }
@@ -408,7 +369,7 @@ export default {
               const head = [
                 `[wait_for] condition met after ${((Date.now() - startedAt) / 1000).toFixed(3)}s`,
                 pid !== undefined ? `pid: ${pid} exited` : "",
-                path ? `path: ${path}` : "",
+                fullPath ? `path: ${fullPath}` : "",
               ]
                 .filter(Boolean)
                 .join(" | ")
@@ -418,11 +379,11 @@ export default {
 
             if (Date.now() >= deadline) {
               const head = [
-                `[wait_for] timed out after ${(timeoutMs / 1000).toFixed(1)}s`,
+                `[wait_for] timed out after ${(waitTimeout / 1000).toFixed(1)}s`,
                 `Reason: ${problems.join("; ")}`,
                 `Last change: ${((Date.now() - lastChangeAt) / 1000).toFixed(1)}s ago`,
                 pidAlive ? `pid ${pid} is still running - the task may simply be slow, not stuck` : "",
-                "Next step: use ps / lsof to check the process; do not call wait_for again immediately.",
+                "Next step: inspect the observed state; do not call wait_for again immediately.",
               ]
                 .filter(Boolean)
                 .join("\n")
@@ -430,13 +391,11 @@ export default {
               return buildResult("timeout", false, body)
             }
 
-            await sleep(Math.min(pollMs, Math.max(1, deadline - Date.now())))
+            await sleep(Math.min(pollInterval, Math.max(1, deadline - Date.now())))
             await reportProgress(problems.join("; ") || "waiting")
           }
         },
       })
     })
-
-    return () => void registration?.dispose?.()
   },
-}
+})
