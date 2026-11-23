@@ -10,10 +10,10 @@ integration.
 
 ## Install
 
-Plugin (this integration branch):
+Plugin:
 
 ```bash
-git clone -b feat/local-integration git@github.com:masterjg/opencode-wait-for-v2.git \
+git clone git@github.com:masterjg/opencode-wait-for-v2.git \
   ~/.config/opencode/repos/opencode-wait-for-v2
 ```
 
