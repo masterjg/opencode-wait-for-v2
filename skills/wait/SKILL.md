@@ -6,8 +6,8 @@ description: Use when a task needs to wait for an external condition instead of 
 # Wait
 
 `tools.wait.for` blocks until a real condition holds or the timeout expires. It checks
-immediately, so an already-true condition returns after one attempt. It also
-watches log files and process exits directly, without a separate `tail` loop.
+immediately, so an already-true condition returns after one attempt. It checks
+log files and process state directly, without a separate `tail` loop.
 
 ## When to use
 
@@ -25,7 +25,7 @@ watches log files and process exits directly, without a separate `tail` loop.
 
 Do not use `tools.wait.for` for arbitrary shell predicates; it never runs a shell.
 
-## Gotchas
+## Avoid
 
 - Never wrap `tools.wait.for` in a shell `for`/`while` loop; that defeats it. One call
   with `timeout_ms` is the loop.
@@ -35,8 +35,8 @@ Do not use `tools.wait.for` for arbitrary shell predicates; it never runs a shel
 
 ## Call it
 
-In this config, use `tools.wait.for` inside `execute`. A host that exposes the
-direct tool calls it `wait_for`. At least one
+In Code Mode, use `tools.wait.for`. A host that exposes the direct tool calls it
+`wait_for`. At least one
 of `condition`, `path`, or `pid` is required.
 
 Four modes:
@@ -59,7 +59,7 @@ const result = JSON.parse(raw)
 
 // Log line: text result with the tail
 const text = await tools.wait.for({
-  path: "/tmp/build.log",
+  path: "/tmp/opencode/build.log",
   pattern: "BUILD (SUCCESS|FAILURE)",
   timeout_ms: 600000,
   tail_lines: 20,
@@ -126,7 +126,7 @@ Wait for a process to exit:
 ```js
 await tools.wait.for({ pid: 12345, timeout_ms: 300000 })
 // combine with a log match:
-await tools.wait.for({ pid: 12345, path: "/tmp/build.log", pattern: "BUILD SUCCESS" })
+await tools.wait.for({ pid: 12345, path: "/tmp/opencode/build.log", pattern: "BUILD SUCCESS" })
 ```
 
 Same via the advanced condition API (`mustBeNew`):
@@ -196,7 +196,7 @@ Handle a timeout:
 ```js
 const result = JSON.parse(
   await tools.wait.for({
-    condition: { type: "file_exists", path: "/tmp/opencode/wait-skill-never" },
+    condition: { type: "file_exists", path: ".wait-skill-never-created" },
     timeout_ms: 250,
     poll_ms: 100,
   }),
@@ -257,7 +257,7 @@ An already-true condition returns quickly:
 ```js
 const result = JSON.parse(
   await tools.wait.for({
-    condition: { type: "file_exists", path: "/var/home/marius/.config/opencode/opencode.jsonc" },
+    condition: { type: "file_exists", path: "." },
     timeout_ms: 1000,
   }),
 )
@@ -269,7 +269,7 @@ A condition that never happens returns a timeout result:
 ```js
 const result = JSON.parse(
   await tools.wait.for({
-    condition: { type: "file_exists", path: "/tmp/opencode/wait-skill-never" },
+    condition: { type: "file_exists", path: ".wait-skill-never-created" },
     timeout_ms: 250,
     poll_ms: 100,
   }),

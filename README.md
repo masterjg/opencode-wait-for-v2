@@ -54,7 +54,7 @@ Confirm with `opencode plugin list`. In Code Mode the tool is `tools.wait.for`.
 ```js
 // Log line
 await tools.wait.for({
-  path: "/tmp/build.log",
+  path: "/tmp/opencode/build.log",
   pattern: "BUILD (SUCCESS|FAILURE)",
   timeout_ms: 600000,
   tail_lines: 20,
@@ -62,7 +62,7 @@ await tools.wait.for({
 
 // New content only
 await tools.wait.for({
-  path: "/tmp/deploy.log",
+  path: "/tmp/opencode/deploy.log",
   pattern: "pod/ready",
   must_be_new: true,
 })
@@ -120,7 +120,7 @@ dot and bracket paths such as `status` or `jobs[0].state`.
 ## Test
 
 ```bash
-bun test wait.test.ts
+bun test wait.test.ts        # or: node --test wait.test.ts
 bun run check
 ```
 

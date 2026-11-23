@@ -11,7 +11,7 @@ Thanks for taking the time to improve `opencode-wait-for-v2`. This document cove
 ## Setup
 
 ```bash
-git clone https://github.com/lcssos/opencode-wait-for-v2
+git clone -b feat/local-integration git@github.com:masterjg/opencode-wait-for-v2.git
 cd opencode-wait-for-v2
 bun install
 bun test
@@ -32,7 +32,7 @@ bun test
 ## Making changes
 
 1. **Open an issue first** for new condition types or behavior changes, so the API stays consistent.
-2. **Add tests.** Any new condition type needs a test in `test/conditions.test.ts` that fails before the change and passes after it.
+2. **Add tests.** Any new condition type needs a test in `wait.test.ts` that fails before the change and passes after it.
 3. **Run the checks** before opening a PR:
 
    ```bash
@@ -46,12 +46,12 @@ bun test
 
 ## Conventions
 
-- **Timeouts are normal results, not exceptions.** `wait_for` returns `hit: false` with `reason: "timeout"` and the last `observed` state. Do not turn this into a thrown error.
+- **Timeouts are normal results, not exceptions.** `tools.wait.for` returns `matched: false` with `timedOut: true` and the last `observed` state. Do not turn this into a thrown error.
 - **`condition` takes precedence** over the legacy `path` / `pattern` / `pid` / `must_be_new` fields. Preserve that behavior.
 - **Never read whole files.** File checks read the tail (64 KB) or the range written after the call starts (up to 256 KB). HTTP bodies are capped at 256 KB.
 - **Honor `AbortSignal`.** Every wait must stop promptly when the caller interrupts (ESC in the UI).
 - **No new runtime dependencies** unless there is a strong reason; zero dependencies is a feature of this plugin.
-- **Do not modify built-in tools.** The plugin only adds `wait_for`; it does not wrap `shell` or other tools.
+- **Do not modify built-in tools.** The plugin only adds `tools.wait.for`; it does not wrap `shell` or other tools.
 - **Commit messages** follow [Conventional Commits](https://www.conventionalcommits.org/): `feat:`, `fix:`, `docs:`, `test:`, `chore:`.
 
 ## Pull requests
