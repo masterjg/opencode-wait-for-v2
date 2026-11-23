@@ -1,11 +1,11 @@
 ---
 name: Wait
-description: Use when a task needs to wait for an external condition instead of fixed sleep loops - a file appears, changes, or contains a marker; a log line appears; a process exits; a TCP port opens or closes; or an HTTP status, JSON field, or body matches. Covers wait_for conditions, log/process waiting, timeouts, result handling, permissions, and polling limits.
+description: Use when a task needs to wait for an external condition instead of fixed sleep loops - a file appears, changes, or contains a marker; a log line appears; a process exits; a TCP port opens or closes; or an HTTP status, JSON field, or body matches. Covers `tools.wait.for` conditions, log/process waiting, timeouts, result handling, permissions, and polling limits.
 ---
 
 # Wait
 
-`wait_for` blocks until a real condition holds or the timeout expires. It checks
+`tools.wait.for` blocks until a real condition holds or the timeout expires. It checks
 immediately, so an already-true condition returns after one attempt. It also
 watches log files and process exits directly, without a separate `tail` loop.
 
@@ -19,24 +19,24 @@ watches log files and process exits directly, without a separate `tail` loop.
 
 | Situation | Use |
 |---|---|
-| An external condition may become true | `wait_for` |
+| An external condition may become true | `tools.wait.for` |
 | There is no condition, only a fixed pause | Avoid; if unavoidable, a bounded `sleep` inside the work command, and state why |
 | The state can be read now | `read`, `stat`, or one HTTP check |
 
-Do not use `wait_for` for arbitrary shell predicates; it never runs a shell.
+Do not use `tools.wait.for` for arbitrary shell predicates; it never runs a shell.
 
 ## Gotchas
 
-- Never wrap `wait_for` in a shell `for`/`while` loop; that defeats it. One call
+- Never wrap `tools.wait.for` in a shell `for`/`while` loop; that defeats it. One call
   with `timeout_ms` is the loop.
-- If `wait_for` cannot reach a URL but the host can, report that and retry once
+- If `tools.wait.for` cannot reach a URL but the host can, report that and retry once
   with a longer timeout; do not substitute a `curl`/`sleep` script.
 - Do not create a temporary polling script with `fs.tee` or a text tool.
 
 ## Call it
 
-In Code Mode, use `tools.wait.for`. If a host exposes the direct tool, it is
-`wait_for`; in this config, use `tools.wait.for` inside `execute`. At least one
+In this config, use `tools.wait.for` inside `execute`. A host that exposes the
+direct tool calls it `wait_for`. At least one
 of `condition`, `path`, or `pid` is required.
 
 Four modes:
